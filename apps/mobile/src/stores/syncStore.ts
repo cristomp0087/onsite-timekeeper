@@ -1,183 +1,312 @@
-/**
- * Sync Store - Gerencia estado de sincronização
- *
- * Localização: apps/mobile/src/stores/syncStore.ts
- */
-
 import { create } from 'zustand';
-import {
-  syncAll,
-  syncLocais,
-  syncRegistros,
-  isOnline,
-  initSyncTables,
-} from '../lib/sync';
-import { useAuthStore } from './authStore';
-import { logger } from '../lib/logger';
 import NetInfo from '@react-native-community/netinfo';
+import { supabase } from '../lib/supabase';
+import { logger } from '../lib/logger';
+import * as SQLite from 'expo-sqlite';
+import {
+  getLocaisAtivos,
+  adicionarLocal,
+  getSessoesHoje,
+  type SessaoDB,
+  type LocalDB,
+} from '../lib/database';
+
+const db = SQLite.openDatabaseSync('onsite.db');
 
 interface SyncState {
-  // Estado
-  isInitialized: boolean;
   isSyncing: boolean;
   lastSyncAt: Date | null;
-  pendingCount: number;
   isOnline: boolean;
-
-  // Erros
-  lastError: string | null;
-
-  // Actions
+  autoSyncEnabled: boolean;
+  
   initialize: () => Promise<void>;
-  syncNow: () => Promise<boolean>;
-  syncLocaisOnly: () => Promise<boolean>;
-  syncRegistrosOnly: () => Promise<boolean>;
-  checkConnection: () => Promise<boolean>;
-
-  // Internal
-  _updatePendingCount: () => void;
+  syncNow: () => Promise<void>;
+  syncLocais: () => Promise<void>;
+  syncRegistros: () => Promise<void>;
+  toggleAutoSync: () => void;
 }
 
+let syncInterval: NodeJS.Timeout | null = null;
+
 export const useSyncStore = create<SyncState>((set, get) => ({
-  isInitialized: false,
   isSyncing: false,
   lastSyncAt: null,
-  pendingCount: 0,
-  isOnline: true,
-  lastError: null,
+  isOnline: false,
+  autoSyncEnabled: true,
 
   initialize: async () => {
-    if (get().isInitialized) return;
+    logger.info('sync', 'Initializing sync store...');
 
-    try {
-      logger.info('syncStore', 'Initializing sync store...');
+    // Monitorar conexão
+    const unsubscribe = NetInfo.addEventListener((state) => {
+      const online = state.isConnected && state.isInternetReachable;
+      set({ isOnline: online ?? false });
 
-      // Inicializar tabelas de sync
-      await initSyncTables();
-
-      // Verificar conexão inicial
-      const online = await isOnline();
-      set({ isOnline: online });
-
-      // Listener de conexão
-      NetInfo.addEventListener((state) => {
-        const wasOffline = !get().isOnline;
-        const isNowOnline = state.isConnected === true;
-
-        set({ isOnline: isNowOnline });
-
-        // Se voltou online, tentar sync
-        if (wasOffline && isNowOnline) {
-          logger.info('syncStore', 'Back online, triggering sync...');
-          get().syncNow();
-        }
-      });
-
-      // Atualizar contagem de pendentes
-      get()._updatePendingCount();
-
-      // Sync inicial se online
-      if (online) {
+      if (online && get().autoSyncEnabled) {
+        logger.info('sync', 'Back online - triggering sync');
         get().syncNow();
       }
+    });
 
-      set({ isInitialized: true });
-      logger.info('syncStore', 'Sync store initialized');
-    } catch (error) {
-      logger.error('syncStore', 'Error initializing', { error: String(error) });
-      set({ lastError: String(error) });
+    // Verificar conexão inicial
+    const state = await NetInfo.fetch();
+    const online = state.isConnected && state.isInternetReachable;
+    set({ isOnline: online ?? false });
+
+    // Auto-sync a cada 5 minutos (se online e habilitado)
+    syncInterval = setInterval(() => {
+      if (get().isOnline && get().autoSyncEnabled && !get().isSyncing) {
+        logger.debug('sync', 'Auto-sync triggered');
+        get().syncNow();
+      }
+    }, 5 * 60 * 1000); // 5 minutos
+
+    logger.info('sync', 'Sync store initialized', {
+      online,
+      autoSync: get().autoSyncEnabled,
+    });
+
+    // Sync inicial se estiver online
+    if (online && get().autoSyncEnabled) {
+      get().syncNow();
     }
+
+    return () => {
+      unsubscribe();
+      if (syncInterval) clearInterval(syncInterval);
+    };
   },
 
   syncNow: async () => {
     const { isSyncing, isOnline } = get();
 
     if (isSyncing) {
-      logger.info('syncStore', 'Sync already in progress');
-      return false;
+      logger.warn('sync', 'Sync already in progress, skipping');
+      return;
     }
 
     if (!isOnline) {
-      logger.info('syncStore', 'Offline, skipping sync');
-      return false;
+      logger.warn('sync', 'Device offline, skipping sync');
+      return;
     }
 
-    const user = useAuthStore.getState().user;
-    if (!user) {
-      logger.info('syncStore', 'No user, skipping sync');
-      return false;
-    }
-
-    set({ isSyncing: true, lastError: null });
+    set({ isSyncing: true });
 
     try {
-      logger.info('syncStore', 'Starting sync...');
+      logger.info('sync', '🔄 Starting full sync...');
 
-      const result = await syncAll(user.id);
+      // 1. Sync locais
+      await get().syncLocais();
 
-      set({
-        lastSyncAt: new Date(),
-        lastError: result.errors.length > 0 ? result.errors.join('; ') : null,
-      });
+      // 2. Sync registros
+      await get().syncRegistros();
 
-      get()._updatePendingCount();
-
-      logger.info('syncStore', 'Sync completed', {
-        success: result.success,
-        uploaded: result.uploaded,
-        downloaded: result.downloaded,
-      });
-
-      return result.success;
+      set({ lastSyncAt: new Date() });
+      logger.info('sync', '✅ Full sync completed');
     } catch (error) {
-      logger.error('syncStore', 'Sync failed', { error: String(error) });
-      set({ lastError: String(error) });
-      return false;
+      logger.error('sync', 'Sync failed', { error: String(error) });
     } finally {
       set({ isSyncing: false });
     }
   },
 
-  syncLocaisOnly: async () => {
-    const user = useAuthStore.getState().user;
-    if (!user || !get().isOnline) return false;
-
+  syncLocais: async () => {
     try {
-      const result = await syncLocais(user.id);
-      get()._updatePendingCount();
-      return result.success;
+      logger.info('sync', '📍 Syncing locais...');
+
+      // 1. Get locais locais (SQLite) - TODOS, não só ativos
+      const locaisLocalTodos = await db.getAllSync<LocalDB>('SELECT * FROM locais');
+
+      // 2. Get user ID
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+
+      if (!user) {
+        logger.warn('sync', 'User not authenticated, skipping locais sync');
+        return;
+      }
+
+      // 3. Upload TODOS os locais (incluindo desativados)
+      const naoSincronizados = locaisLocalTodos.filter(
+        (l) => !l.synced_at || new Date(l.updated_at) > new Date(l.synced_at)
+      );
+
+      if (naoSincronizados.length > 0) {
+        logger.info('sync', `⬆️ Uploading ${naoSincronizados.length} locais`);
+
+        for (const local of naoSincronizados) {
+          const { error } = await supabase.from('locais').upsert({
+            id: local.id,
+            user_id: user.id,
+            nome: local.nome,
+            latitude: local.latitude,
+            longitude: local.longitude,
+            raio: local.raio,
+            cor: local.cor,
+            ativo: local.ativo === 1, // Propaga soft delete!
+            created_at: local.created_at,
+            updated_at: local.updated_at,
+            synced_at: new Date().toISOString(),
+          });
+
+          if (error) {
+            logger.error('sync', 'Error uploading local', {
+              id: local.id,
+              error: error.message,
+            });
+          } else {
+            logger.debug('sync', 'Local uploaded', { 
+              id: local.id,
+              ativo: local.ativo === 1 
+            });
+            
+            // Marcar como sincronizado no SQLite
+            db.runSync(
+              'UPDATE locais SET synced_at = ? WHERE id = ?',
+              [new Date().toISOString(), local.id]
+            );
+          }
+        }
+      }
+
+      // 4. Download locais do servidor
+      const { data: locaisRemote, error: downloadError } = await supabase
+        .from('locais')
+        .select('*')
+        .eq('user_id', user.id);
+
+      if (downloadError) {
+        logger.error('sync', 'Error downloading locais', {
+          error: downloadError.message,
+        });
+        return;
+      }
+
+      // 5. Atualizar/inserir locais remotos no SQLite
+      if (locaisRemote && locaisRemote.length > 0) {
+        logger.info('sync', `⬇️ Processing ${locaisRemote.length} remote locais`);
+
+        for (const remoteLocal of locaisRemote) {
+          const localExistente = locaisLocalTodos.find((l) => l.id === remoteLocal.id);
+
+          if (!localExistente) {
+            // Novo local do servidor - inserir
+            db.runSync(
+              `INSERT INTO locais (id, user_id, nome, latitude, longitude, raio, cor, ativo, created_at, updated_at, synced_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                remoteLocal.id,
+                user.id,
+                remoteLocal.nome,
+                remoteLocal.latitude,
+                remoteLocal.longitude,
+                remoteLocal.raio,
+                remoteLocal.cor || '#3B82F6',
+                remoteLocal.ativo ? 1 : 0,
+                remoteLocal.created_at,
+                remoteLocal.updated_at,
+                new Date().toISOString(),
+              ]
+            );
+            logger.debug('sync', 'Remote local inserted', { id: remoteLocal.id });
+          } else {
+            // Local existente - atualizar se servidor é mais recente
+            const remoteNewer = new Date(remoteLocal.updated_at) > new Date(localExistente.updated_at);
+            
+            if (remoteNewer) {
+              db.runSync(
+                `UPDATE locais SET nome = ?, latitude = ?, longitude = ?, raio = ?, cor = ?, ativo = ?, updated_at = ?, synced_at = ? WHERE id = ?`,
+                [
+                  remoteLocal.nome,
+                  remoteLocal.latitude,
+                  remoteLocal.longitude,
+                  remoteLocal.raio,
+                  remoteLocal.cor,
+                  remoteLocal.ativo ? 1 : 0,
+                  remoteLocal.updated_at,
+                  new Date().toISOString(),
+                  remoteLocal.id,
+                ]
+              );
+              logger.debug('sync', 'Local updated from remote', { id: remoteLocal.id });
+            }
+          }
+        }
+      }
+
+      logger.info('sync', '✅ Locais synced');
     } catch (error) {
-      logger.error('syncStore', 'Sync locais failed', { error: String(error) });
-      return false;
+      logger.error('sync', 'Error syncing locais', { error: String(error) });
+      throw error;
     }
   },
 
-  syncRegistrosOnly: async () => {
-    const user = useAuthStore.getState().user;
-    if (!user || !get().isOnline) return false;
-
+  syncRegistros: async () => {
     try {
-      const result = await syncRegistros(user.id);
-      get()._updatePendingCount();
-      return result.success;
+      logger.info('sync', '📝 Syncing registros...');
+
+      // 1. Get registros locais (SQLite)
+      const registrosLocal = await getSessoesHoje();
+
+      // 2. Get user ID
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+
+      if (!user) {
+        logger.warn('sync', 'User not authenticated, skipping registros sync');
+        return;
+      }
+
+      // 3. Upload registros não sincronizados
+      const naoSincronizados = registrosLocal.filter((r) => !r.synced_at);
+
+      if (naoSincronizados.length > 0) {
+        logger.info('sync', `⬆️ Uploading ${naoSincronizados.length} registros`);
+
+        for (const registro of naoSincronizados) {
+          const { error } = await supabase.from('registros').upsert({
+            id: registro.id,
+            user_id: user.id,
+            local_id: registro.local_id,
+            local_nome: registro.local_nome,
+            entrada: registro.entrada,
+            saida: registro.saida,
+            tipo: registro.tipo,
+            editado_manualmente: registro.editado_manualmente === 1,
+            motivo_edicao: registro.motivo_edicao,
+            hash_integridade: registro.hash_integridade,
+            cor: registro.cor,
+            device_id: registro.device_id,
+            created_at: registro.created_at,
+            synced_at: new Date().toISOString(),
+          });
+
+          if (error) {
+            logger.error('sync', 'Error uploading registro', {
+              id: registro.id,
+              error: error.message,
+            });
+          } else {
+            logger.debug('sync', 'Registro uploaded', { id: registro.id });
+            // TODO: Marcar como sincronizado no SQLite
+          }
+        }
+      }
+
+      logger.info('sync', '✅ Registros synced');
     } catch (error) {
-      logger.error('syncStore', 'Sync registros failed', {
-        error: String(error),
-      });
-      return false;
+      logger.error('sync', 'Error syncing registros', { error: String(error) });
+      throw error;
     }
   },
 
-  checkConnection: async () => {
-    const online = await isOnline();
-    set({ isOnline: online });
-    return online;
-  },
-
-  _updatePendingCount: () => {
-    // Contar itens não sincronizados
-    // TODO: Implementar contagem do SQLite
-    // Por enquanto, deixar 0
-    set({ pendingCount: 0 });
+  toggleAutoSync: () => {
+    set((state) => {
+      const newValue = !state.autoSyncEnabled;
+      logger.info('sync', `Auto-sync ${newValue ? 'enabled' : 'disabled'}`);
+      return { autoSyncEnabled: newValue };
+    });
   },
 }));

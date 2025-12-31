@@ -13,6 +13,7 @@ import { useLocationStore } from '../../src/stores/locationStore';
 import { useRegistroStore } from '../../src/stores/registroStore';
 import { useWorkSessionStore } from '../../src/stores/workSessionStore';
 import { useSettingsStore } from '../../src/stores/settingsStore';
+import { useSyncStore } from '../../src/stores/syncStore';
 import { logger } from '../../src/lib/logger';
 import { colors } from '../../src/constants/colors';
 import { Button } from '../../src/components/ui/Button';
@@ -32,6 +33,15 @@ export default function HomeScreen() {
     activeGeofence,
     isInitialized: locationInitialized,
   } = useLocationStore();
+
+  // Sync store
+  const {
+    initialize: initSync,
+    syncNow,
+    isSyncing,
+    lastSyncAt,
+    isOnline,
+  } = useSyncStore();
 
   // Configurações personalizáveis
   const {
@@ -97,9 +107,12 @@ export default function HomeScreen() {
         // 3. Inicializar localização (vai auto-iniciar monitoramento se necessário)
         await initLocation();
 
+        // 4. Inicializar sync (novo!)
+        await initSync();
+
         logger.info('home', 'Full initialization complete');
       } catch (error) {
-        logger.error('home', 'Initialization error', { error });
+        logger.error('home', 'Initialization failed', { error: String(error) });
       } finally {
         setIsInitializing(false);
       }
@@ -108,16 +121,17 @@ export default function HomeScreen() {
     initializeAll();
   }, []);
 
-  // Mostrar alert quando há pending entry ou exit
+  // Monitorar pending events
   useEffect(() => {
     if (pendingEntry) {
+      const localName = locais.find((l) => l.id === pendingEntry.localId)?.nome;
       setAlertData({
         type: 'enter',
         localId: pendingEntry.localId,
-        localNome: pendingEntry.localNome,
-        onStart: handleAlertStart,
-        onDelayEntry: handleAlertDelayEntry,
-        onSkipToday: handleAlertSkipToday,
+        localNome: localName || 'Local',
+        onStart: handleAlertStartNow,
+        onDelayEntry: handleAlertStartDelay,
+        onSkipToday: handleAlertSkip,
         onStop: () => {},
         onStopAgo1: () => {},
         onStopAgo2: () => {},
@@ -125,65 +139,79 @@ export default function HomeScreen() {
       });
       setShowAlert(true);
     } else if (pendingExit) {
+      const localName = locais.find((l) => l.id === pendingExit.localId)?.nome;
       setAlertData({
         type: 'exit',
         localId: pendingExit.localId,
-        localNome: pendingExit.localNome,
+        localNome: localName || 'Local',
         onStart: () => {},
         onDelayEntry: () => {},
         onSkipToday: () => {},
-        onStop: handleAlertStop,
+        onStop: handleAlertStopNow,
         onStopAgo1: handleAlertStopAgo1,
         onStopAgo2: handleAlertStopAgo2,
         onDismiss: handleAlertDismiss,
       });
       setShowAlert(true);
-    } else {
-      setShowAlert(false);
-      setAlertData(null);
     }
-  }, [pendingEntry, pendingExit]);
+  }, [
+    pendingEntry,
+    pendingExit,
+    locais,
+    handleAlertStartNow,
+    handleAlertStartDelay,
+    handleAlertSkip,
+    handleAlertStopNow,
+    handleAlertStopAgo1,
+    handleAlertStopAgo2,
+    handleAlertDismiss,
+  ]);
 
-  // Handlers do Alert - ENTRADA
-  const handleAlertStart = useCallback(async () => {
+  const handleAlertStartNow = useCallback(async () => {
     if (!pendingEntry) return;
     setShowAlert(false);
     await startTimer(pendingEntry.localId, pendingEntry.coords);
     clearPending();
     refreshData();
-  }, [pendingEntry, startTimer, clearPending, refreshData]);
+  }, [pendingEntry, clearPending, refreshData, startTimer]);
 
-  const handleAlertDelayEntry = useCallback(async () => {
+  const handleAlertStartDelay = useCallback(async () => {
     if (!pendingEntry) return;
     setShowAlert(false);
-    await scheduleDelayedStart(
+    scheduleDelayedStart(
       pendingEntry.localId,
       pendingEntry.localNome,
-      entryDelayOption
+      entryDelayOption,
+      pendingEntry.coords
     );
     clearPending();
-  }, [pendingEntry, scheduleDelayedStart, clearPending, entryDelayOption]);
+    refreshData();
+  }, [
+    pendingEntry,
+    clearPending,
+    refreshData,
+    entryDelayOption,
+    scheduleDelayedStart,
+  ]);
 
-  const handleAlertSkipToday = useCallback(() => {
+  const handleAlertSkip = useCallback(() => {
     if (!pendingEntry) return;
     setShowAlert(false);
     addToSkippedToday(pendingEntry.localId);
     clearPending();
-  }, [pendingEntry, addToSkippedToday, clearPending]);
+  }, [pendingEntry, clearPending, addToSkippedToday]);
 
-  // Handlers do Alert - SAÍDA
-  const handleAlertStop = useCallback(async () => {
+  const handleAlertStopNow = useCallback(async () => {
     if (!pendingExit) return;
     setShowAlert(false);
     await stopTimer(pendingExit.localId, pendingExit.coords);
     clearPending();
     refreshData();
-  }, [pendingExit, stopTimer, clearPending, refreshData]);
+  }, [pendingExit, clearPending, refreshData, stopTimer]);
 
   const handleAlertStopAgo1 = useCallback(async () => {
     if (!pendingExit) return;
     setShowAlert(false);
-    // Encerrar com desconto de X minutos (configurável)
     scheduleDelayedStop(
       pendingExit.localId,
       pendingExit.localNome,
@@ -203,7 +231,6 @@ export default function HomeScreen() {
   const handleAlertStopAgo2 = useCallback(async () => {
     if (!pendingExit) return;
     setShowAlert(false);
-    // Encerrar com desconto de X minutos (configurável)
     scheduleDelayedStop(
       pendingExit.localId,
       pendingExit.localNome,
@@ -222,7 +249,6 @@ export default function HomeScreen() {
 
   const handleAlertDismiss = useCallback(() => {
     setShowAlert(false);
-    // Não limpa pending - vai continuar o countdown via notificação do sistema
   }, []);
 
   // Cronômetro em tempo real - APENAS SESSÃO ATUAL
@@ -231,7 +257,6 @@ export default function HomeScreen() {
 
     const updateTime = () => {
       if (!sessaoAtual) {
-        // Sem sessão ativa - mostrar ZERO (não total do dia)
         setElapsedSeconds(0);
         return;
       }
@@ -242,24 +267,20 @@ export default function HomeScreen() {
         (agora.getTime() - inicio.getTime()) / 1000
       );
 
-      // Tempo pausado (em segundos)
       const tempoPausado = (sessaoAtual.tempo_pausado_minutos || 0) * 60;
 
       if (sessaoAtual.status === 'ativa') {
-        // Mostrar APENAS tempo desta sessão
         setElapsedSeconds(Math.max(0, diffSeconds - tempoPausado));
       } else if (sessaoAtual.status === 'pausada') {
-        // Quando pausado, mostrar último valor
         setElapsedSeconds(Math.max(0, diffSeconds - tempoPausado));
       } else {
-        // Finalizada - mostrar zero para próxima sessão
         setElapsedSeconds(0);
       }
     };
 
     if (sessaoAtual && sessaoAtual.status === 'ativa') {
       updateTime();
-      timer = setInterval(updateTime, 1000); // Atualiza a cada segundo
+      timer = setInterval(updateTime, 1000);
     } else {
       updateTime();
     }
@@ -329,7 +350,7 @@ export default function HomeScreen() {
     retomar();
   };
 
-  // Encerrar - CORRIGIDO
+  // Encerrar
   const handleStop = () => {
     if (!sessaoAtual) return;
 
@@ -358,16 +379,12 @@ export default function HomeScreen() {
                   : undefined
               );
 
-              // Forçar refresh após encerrar
-              await refreshData();
-
+              refreshData();
               logger.info('home', 'Session stopped successfully');
             } catch (error) {
-              logger.error('home', 'Error stopping session', { error });
-              Alert.alert(
-                'Erro',
-                'Não foi possível encerrar a sessão. Tente novamente.'
-              );
+              logger.error('home', 'Error stopping session', {
+                error: String(error),
+              });
             }
           },
         },
@@ -375,19 +392,25 @@ export default function HomeScreen() {
     );
   };
 
+  // Teste de sync manual
+  const handleTestSync = async () => {
+    logger.info('home', '🧪 Manual sync triggered by user');
+    await syncNow();
+    Alert.alert('Sync', 'Sincronização completa!');
+  };
+
   if (isInitializing) {
     return (
-      <SafeAreaView style={styles.container}>
+      <SafeAreaView style={styles.container} edges={['top']}>
         <View style={styles.loadingContainer}>
-          <Text style={styles.loadingText}>Carregando...</Text>
+          <Text style={styles.loadingText}>Inicializando...</Text>
         </View>
       </SafeAreaView>
     );
   }
 
   return (
-    <SafeAreaView style={styles.container}>
-      {/* Alert grande estilo despertador */}
+    <SafeAreaView style={styles.container} edges={['top']}>
       <GeofenceAlert
         visible={showAlert}
         data={alertData}
@@ -398,6 +421,7 @@ export default function HomeScreen() {
       />
 
       <ScrollView>
+        {/* Header */}
         <View style={styles.header}>
           <Text style={styles.greeting}>👋 Olá!</Text>
           <Text style={styles.email}>{user?.email}</Text>
@@ -406,42 +430,47 @@ export default function HomeScreen() {
         {/* Status Card */}
         <View
           style={[
-            styles.card,
-            isWorking && !isPaused && styles.activeCard,
-            isPaused && styles.pausedCard,
+            styles.statusCard,
+            isWorking && !isPaused && styles.statusCardActive,
           ]}
         >
-          <Text style={styles.cardTitle}>📍 Status</Text>
+          <Text style={styles.statusLabel}>📍 Status</Text>
 
           {isWorking ? (
             <>
-              <Text style={[styles.statusText, isPaused && styles.pausedText]}>
+              <Text
+                style={[
+                  styles.statusText,
+                  isPaused ? styles.statusTextPaused : styles.statusTextActive,
+                ]}
+              >
                 {isPaused ? '⏸️ PAUSADO' : '🟢 TRABALHANDO'}
               </Text>
               <Text style={styles.localName}>
-                {sessaoAtual?.local_nome || activeLocal?.nome || 'Local'}
+                {sessaoAtual?.local_nome || 'Local'}
               </Text>
               <Text style={styles.sinceText}>
                 Desde{' '}
-                {new Date(sessaoAtual!.entrada).toLocaleTimeString('pt-BR', {
-                  hour: '2-digit',
-                  minute: '2-digit',
-                })}
+                {sessaoAtual?.entrada
+                  ? new Date(sessaoAtual.entrada).toLocaleTimeString('pt-BR', {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    })
+                  : '-'}
               </Text>
 
-              {/* Botões de controle */}
-              <View style={styles.controlButtons}>
-                {isPaused ? (
-                  <Button
-                    title="▶️ Retomar"
-                    onPress={handleResume}
-                    style={styles.resumeButton}
-                  />
-                ) : (
+              <View style={styles.buttonRow}>
+                {!isPaused ? (
                   <Button
                     title="⏸️ Pausar"
                     onPress={handlePause}
-                    variant="outline"
+                    variant="secondary"
+                    style={styles.pauseButton}
+                  />
+                ) : (
+                  <Button
+                    title="▶️ Retomar"
+                    onPress={handleResume}
                     style={styles.pauseButton}
                   />
                 )}
@@ -514,7 +543,7 @@ export default function HomeScreen() {
                       hour: '2-digit',
                       minute: '2-digit',
                     })}
-                    {sessao.fim
+                    {sessao.saida
                       ? ` - ${new Date(sessao.saida).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`
                       : ' - agora'}
                   </Text>
@@ -563,6 +592,35 @@ export default function HomeScreen() {
           )}
         </View>
 
+        {/* Sync Info - NOVO! */}
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>☁️ Sincronização</Text>
+          <View style={styles.gpsRow}>
+            <Text style={styles.gpsLabel}>Status:</Text>
+            <Text style={[styles.gpsValue, isOnline && styles.activeGps]}>
+              {isOnline ? '🟢 Online' : '⚫ Offline'}
+            </Text>
+          </View>
+          <View style={styles.gpsRow}>
+            <Text style={styles.gpsLabel}>Última sync:</Text>
+            <Text style={styles.gpsValue}>
+              {lastSyncAt
+                ? new Date(lastSyncAt).toLocaleTimeString('pt-BR', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  })
+                : 'Nunca'}
+            </Text>
+          </View>
+          <Button
+            title={isSyncing ? '⏳ Sincronizando...' : '🔄 Sync Manual'}
+            onPress={handleTestSync}
+            variant="secondary"
+            style={{ marginTop: 12 }}
+            disabled={isSyncing || !isOnline}
+          />
+        </View>
+
         <View style={{ height: 100 }} />
       </ScrollView>
     </SafeAreaView>
@@ -598,99 +656,96 @@ const styles = StyleSheet.create({
   },
   card: {
     backgroundColor: colors.background,
-    borderRadius: 16,
-    padding: 16,
     marginHorizontal: 16,
-    marginBottom: 12,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 8,
-    elevation: 2,
+    marginBottom: 16,
+    padding: 16,
+    borderRadius: 12,
   },
-  activeCard: {
-    backgroundColor: '#DCFCE7',
+  statusCard: {
+    backgroundColor: colors.background,
+    marginHorizontal: 16,
+    marginBottom: 16,
+    padding: 20,
+    borderRadius: 12,
     borderWidth: 2,
+    borderColor: colors.border,
+  },
+  statusCardActive: {
     borderColor: colors.success,
+    backgroundColor: '#E8F5E9',
   },
-  pausedCard: {
-    backgroundColor: '#FEF3C7',
-    borderWidth: 2,
-    borderColor: '#F59E0B',
-  },
-  cardTitle: {
+  statusLabel: {
     fontSize: 14,
-    fontWeight: '600',
     color: colors.textSecondary,
     marginBottom: 8,
   },
   statusText: {
-    fontSize: 14,
+    fontSize: 24,
     fontWeight: 'bold',
+    marginBottom: 8,
+  },
+  statusTextActive: {
     color: colors.success,
   },
-  pausedText: {
-    color: '#F59E0B',
-  },
-  localName: {
-    fontSize: 22,
-    fontWeight: 'bold',
-    color: colors.text,
-    marginTop: 4,
-  },
-  sinceText: {
-    fontSize: 14,
-    color: colors.textSecondary,
-    marginTop: 4,
-  },
-  controlButtons: {
-    flexDirection: 'row',
-    marginTop: 16,
-    gap: 8,
-  },
-  pauseButton: {
-    flex: 1,
-  },
-  resumeButton: {
-    flex: 1,
-    backgroundColor: colors.success,
-  },
-  stopButton: {
-    flex: 1,
-    backgroundColor: '#FEE2E2',
+  statusTextPaused: {
+    color: colors.warning,
   },
   inactiveText: {
     fontSize: 18,
     color: colors.textSecondary,
   },
-  hint: {
-    fontSize: 14,
-    color: colors.textTertiary,
-    marginTop: 8,
+  localName: {
+    fontSize: 20,
+    fontWeight: '600',
+    color: colors.text,
+    marginBottom: 4,
   },
-  warningText: {
-    fontSize: 12,
-    color: '#F59E0B',
-    marginTop: 8,
+  sinceText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+    marginBottom: 16,
+  },
+  buttonRow: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  pauseButton: {
+    flex: 1,
+  },
+  stopButton: {
+    flex: 1,
+  },
+  cardTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: colors.text,
+    marginBottom: 12,
   },
   bigNumber: {
     fontSize: 36,
     fontWeight: 'bold',
-    color: colors.primary,
-    fontVariant: ['tabular-nums'],
+    color: colors.text,
+    textAlign: 'center',
+    marginVertical: 8,
   },
   activeNumber: {
     color: colors.success,
   },
   runningIndicator: {
-    fontSize: 12,
+    fontSize: 14,
     color: colors.success,
-    marginTop: 4,
+    textAlign: 'center',
   },
   pausedIndicator: {
-    fontSize: 12,
-    color: '#F59E0B',
-    marginTop: 4,
+    fontSize: 14,
+    color: colors.warning,
+    textAlign: 'center',
+  },
+  hint: {
+    fontSize: 14,
+    color: colors.textTertiary,
+    textAlign: 'center',
+    marginTop: 8,
   },
   sessaoItem: {
     flexDirection: 'row',
@@ -705,20 +760,21 @@ const styles = StyleSheet.create({
   },
   sessaoLocal: {
     fontSize: 14,
-    fontWeight: '500',
+    fontWeight: '600',
     color: colors.text,
   },
   sessaoTime: {
     fontSize: 12,
     color: colors.textSecondary,
+    marginTop: 2,
   },
   sessaoDuracao: {
     fontSize: 14,
     fontWeight: '600',
-    color: colors.primary,
+    color: colors.text,
   },
   pausedDuracao: {
-    color: '#F59E0B',
+    color: colors.warning,
   },
   activeDuracao: {
     color: colors.success,
@@ -726,18 +782,23 @@ const styles = StyleSheet.create({
   gpsRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: 6,
+    paddingVertical: 4,
   },
   gpsLabel: {
+    fontSize: 14,
     color: colors.textSecondary,
-    fontSize: 13,
   },
   gpsValue: {
+    fontSize: 14,
     color: colors.text,
-    fontSize: 13,
-    fontFamily: 'monospace',
+    fontWeight: '500',
   },
   activeGps: {
     color: colors.success,
+  },
+  warningText: {
+    fontSize: 12,
+    color: colors.warning,
+    marginTop: 8,
   },
 });

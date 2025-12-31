@@ -109,8 +109,39 @@ export async function adicionarLocal(dados: {
   const id = generateUUID();
   const agora = new Date().toISOString();
   const userId = dados.user_id || 'user_local';
+  const raio = dados.raio || 100;
 
   try {
+    // VALIDAÇÃO 1: Verificar sobreposição com outros locais ativos
+    const locaisAtivos = await getLocaisAtivos();
+    
+    for (const local of locaisAtivos) {
+      const distancia = calculateDistanceBetweenPoints(
+        dados.latitude,
+        dados.longitude,
+        local.latitude,
+        local.longitude
+      );
+      
+      // Se a distância é menor que a soma dos raios, há sobreposição
+      const somaRaios = raio + local.raio;
+      
+      if (distancia < somaRaios) {
+        const erro = `Geofence sobrepõe local "${local.nome}" (distância: ${distancia.toFixed(0)}m, mínimo: ${somaRaios}m)`;
+        logger.warn('database', erro);
+        throw new Error(erro);
+      }
+    }
+
+    // VALIDAÇÃO 2: Verificar nome duplicado (case insensitive)
+    const nomeDuplicado = locaisAtivos.find(
+      (l) => l.nome.toLowerCase() === dados.nome.toLowerCase()
+    );
+    
+    if (nomeDuplicado) {
+      throw new Error(`Já existe um local com o nome "${dados.nome}"`);
+    }
+
     db.runSync(
       `INSERT INTO locais (id, user_id, nome, latitude, longitude, raio, cor, ativo, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
@@ -120,7 +151,7 @@ export async function adicionarLocal(dados: {
         dados.nome,
         dados.latitude,
         dados.longitude,
-        dados.raio || 100,
+        raio,
         dados.cor || '#3B82F6',
         agora,
         agora
@@ -156,8 +187,12 @@ export async function getLocalById(id: string): Promise<LocalDB | null> {
 
 export async function deleteLocal(id: string): Promise<void> {
   try {
-    db.runSync(`DELETE FROM locais WHERE id = ?`, [id]);
-    logger.info('database', 'Local deletado', { id });
+    // SOFT DELETE: marca como inativo ao invés de deletar
+    db.runSync(`UPDATE locais SET ativo = 0, updated_at = ? WHERE id = ?`, [
+      new Date().toISOString(),
+      id
+    ]);
+    logger.info('database', 'Local desativado (soft delete)', { id });
   } catch (error) {
     logger.error('database', 'Erro ao deletar local', { error: String(error) });
     throw error;
@@ -390,6 +425,37 @@ function calculateDurationSafe(start: string, end: string): number {
     logger.error('database', 'Error in calculateDuration', { error: String(error) });
     return 0;
   }
+}
+
+/**
+ * Calcula distância entre dois pontos geográficos (Haversine formula)
+ * Retorna distância em METROS
+ */
+function calculateDistanceBetweenPoints(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+): number {
+  const R = 6371000; // Raio da Terra em metros
+  const dLat = toRadians(lat2 - lat1);
+  const dLon = toRadians(lon2 - lon1);
+
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRadians(lat1)) *
+      Math.cos(toRadians(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  const distance = R * c;
+
+  return distance;
+}
+
+function toRadians(degrees: number): number {
+  return degrees * (Math.PI / 180);
 }
 
 /**
