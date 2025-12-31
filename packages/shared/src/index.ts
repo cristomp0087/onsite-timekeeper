@@ -1,5 +1,5 @@
 /**
- * @onsite-timekeeper/shared
+ * @onsite-flow/shared
  * Código compartilhado entre mobile e web
  */
 

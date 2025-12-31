@@ -1,5 +1,6 @@
 /**
  * Utilities compartilhadas
+ * Serão populadas nos próximos checkpoints
  */
 
 /**
@@ -22,8 +23,8 @@ export function calcularHashIntegridade(
   localId: string
 ): string {
   const data = `${entrada}|${saida || ''}|${localId}`;
-  // Hash simples - será melhorado com crypto
-  return btoa(data);
+  // Hash simples para CP0 - será melhorado
+  return Buffer.from(data).toString('base64');
 }
 
 /**

@@ -1,5 +1,6 @@
 /**
  * Types compartilhados
+ * Serão populados nos próximos checkpoints
  */
 
 export interface Local {
